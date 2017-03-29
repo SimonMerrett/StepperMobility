@@ -1,0 +1,286 @@
+/*
+-----BowlsBuggy----- 
+
+Sketch for ATMEGA328P-based microcontrollers
+Takes a joystick input and controls two geared stepper motors for 
+moving and steering an indoor bowls wheelchair. Also controls powered
+engage/disengage mechanism for the drive system.
+
+Copyright 2017 Simon Merrett
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+BEAR IN MIND THIS IS WORK IN PROGRESS - COMMENTING IS SPARSE, 
+STRUCTURE BELIES MY IGNORANCE OF GRACEFUL CODING AND 
+DECLARED/INITIALIZED VARIABLES MAY NOT EVEN BE IN USE
+*/
+
+//interrupt routine volatiles:
+volatile int lPulse = 0;
+volatile int rPulse = 0;
+volatile int lLim = 0;
+volatile int rLim = 0;
+volatile boolean engageFlag = 0;
+volatile boolean pulse = 1;
+long lCount = 0;
+byte rCount = 0;
+
+//declare other global variables:
+const byte lDirPin = 5; //sets left stepper direction
+const byte lStepPin = 6; //sends the pulses to the stepper driver to advance the motor by steps/microsteps
+const byte enPin = 7; //enables both steppers when LOW
+const byte rStepPin = 8; //sends the pulses to the stepper driver to advance the motor by steps/microsteps
+const byte rDirPin = 9; //sets right stepper direction
+
+const byte batEnPin = 4;//this turns battery on/off depending on voltage levels sensed
+const byte yPin = A0; //forward and reverse joystick readings
+const byte xPin = A1; //left and right joystick readings
+const byte drvSwitchPin = A2; // this is polled to see if the drive is requested to be engaged or disengaged (toggles each time)
+const byte drvEngagePin = 11; // 
+const byte drvDisengagePin = 12; // 
+const byte gndPin = A3; //Ground pin for analogue readings
+const byte bat1Pin = A4; //allows battery 1 voltage read
+const byte bat2Pin = A5; //allows battery 2 voltage read
+
+const long acceleration = 500; // maximum rate of change of velocity in mm/s^2
+const byte microStepping = 16; //allows pulse frequency to adapt to different microstepping rates
+const byte stepsPerRotation = 200; //allows pulse frequency to adapt to different stepper motors
+const int updatePeriod = 200; //***update period in milliseconds between readings and velocity settings 
+const int accnPeriod = 80; //***update period in milliseconds between readings and velocity settings was 60
+int pulsePerRotation = microStepping*stepsPerRotation; //calculate the pulses needed for single rotation
+byte wheelDia = 95; //mm
+int wheelCirc = (wheelDia*314)/100; //mm
+int pulsePerMm = pulsePerRotation/wheelCirc; //calculate the pulses per mm
+int pulsePerPeriod = 0; // this will be live updated in accelerate() function
+long pulsePeriod =  acceleration * accnPeriod / 1000; // mm/s cahnge per update period
+int velNow; //current velocity
+int velNext; //velocity for next 100ms time period
+int velNew; //requested velocity
+int velMaxFwd = 1200; // mm/s maximum straight line forward velocity
+int velMaxRev = 300; // mm/s maximum straight line reverse velocity
+int rWheelVel;
+int lWheelVel;
+boolean switchState = 0;
+boolean oldSwitchState = 1;
+long updateMarkTime = 0; // records the time for input update checking
+long accnMarkTime = 0; // records the time for acceleration update checking
+int delta;
+int xRead;
+int yRead;
+byte lRead;
+byte rRead;
+int xMag;
+int yMag;
+int pulseArray[23] ={
+  // 255,177,136,110, 92,79,69,61,55,50,46,42,39,36,34,32,30,28,27,26,25,24,23};// version 1: 32 uStepping 40mm/s/s
+  // 256,160,116, 91, 75,64,56,50,44,40,37,34,32,30,28,26,25,24,23,22,21,20,19};// version 2: 4 uStepping 50mm/s/s
+  // 143, 89, 64, 50, 40,33,28,24,21,18,16,14,12,11,10, 9, 8, 8, 7, 7, 7, 6, 6};// version 3: 16 uStepping 50mm/s/s
+  // 140, 128, 102, 92, 80,71,54,40,36,32,30,28,26,24,23,22,21,21,20,19,18,15,14}; // version 4: 4 uStepping 50mm/s/s
+  // 197,121, 85, 65, 53,44,37,33,29,25,23,21,19,17,16,14,13,13,12,11,10, 9, 9}; // version 5: 8 uStepping 50mm/s/s
+  // 256,185,145,120,102,89,80,72,65,60,56,52,49,46,43,41,40,40,40,40,40,40,40}; // version 6: 2 uStepping 50mm/s/s
+  // 204, 92, 82, 68,55,50,44,40,36,32,30,28,26,24,22,21,20,19,18,17,16,15,13}; // version 4: 4 uStepping 50mm/s/s
+   255,240,225,210,195,184,174,160,144,128,120,112,104,96,92,84,80,80,76,72,68,64}; // version 7: 1 uStepping
+  //   368,288,240,204,176,160,144,128,120,112,104,96,92,84,80,80,76,72,68,64,62,60}; // version 8: 1 uStepping
+
+
+
+void setup() {
+delay(1000);
+  //Serial for debugging only
+ // Serial.begin(115200);
+  pinMode(enPin,OUTPUT);
+  pinMode(lDirPin,OUTPUT);
+  pinMode(lStepPin,OUTPUT);
+  pinMode(rDirPin,OUTPUT);
+  pinMode(rStepPin,OUTPUT);
+  pinMode(batEnPin,OUTPUT);
+  pinMode(xPin,INPUT);
+  pinMode(yPin,INPUT);
+  pinMode(gndPin,OUTPUT);
+  pinMode(bat1Pin,INPUT);
+  pinMode(bat2Pin,INPUT);
+  pinMode(drvSwitchPin, INPUT);
+  pinMode(drvEngagePin, OUTPUT);
+  pinMode(drvDisengagePin, OUTPUT);
+  digitalWrite(gndPin, LOW);
+  digitalWrite(enPin, HIGH);
+  delay(100);
+
+  // set up Timer 1
+  TCCR1A = 0;// set entire TCCR1A register to 0
+  TCCR1B = 0;// same for TCCR1B
+  TCNT1  = 0;//initialize counter value to 0
+  TCCR1A = 0;          // normal CTC operation
+  TCCR1B = bit(WGM12) | bit(CS10) | bit (CS11);   // CTC, scale to clock / 64 VERSION 1
+  //TCCR1B = bit(WGM12) | bit(CS12);   // CTC, scale to clock / 256 
+  OCR1A =  1;       // compare A register value (OCR1A value * clock speed / prescaler) =1 for Version 1, =3 for version 2
+  TIMSK1 |= (1 << OCIE1A); // enable timer compare interrupt
+}
+
+void loop() {
+  if(millis()-updateMarkTime > updatePeriod) {
+    updateMarkTime=millis(); 
+    engage();
+    readDirn();
+    //    Serial.print(rLim);
+    //    Serial.println(lLim);
+    //    Serial.print(rWheelVel);
+    //    Serial.println(lWheelVel);
+    //    Serial.println();
+  }
+  if(millis()-accnMarkTime > pulsePeriod) {
+    accnMarkTime=millis(); 
+    accelerate();
+    rotate();
+
+  }
+}
+
+void engage(){
+  switchState = digitalRead(drvSwitchPin);
+  if (switchState != oldSwitchState){
+    if(switchState == 1){
+      digitalWrite(drvEngagePin, LOW);
+      digitalWrite(drvDisengagePin, HIGH);
+      delay(2800);
+    }
+    else if(switchState == 0){
+      digitalWrite(drvEngagePin, HIGH);
+      digitalWrite(drvDisengagePin, LOW);
+      delay(2800);
+    }
+    oldSwitchState = switchState;
+    digitalWrite(drvEngagePin, LOW);
+    digitalWrite(drvDisengagePin, LOW);
+  }
+  //  if(abs(velNext)>0)     digitalWrite(enPin, LOW);
+  int wheelsTurn = abs(rWheelVel) + abs(lWheelVel);
+  if(wheelsTurn == 0 && lWheelVel == 0 && rCount == 0) {
+    lCount = millis();
+    rCount = 1;
+    pulse = 0;
+  }
+  //  Serial.print(rCount);
+  //  Serial.print(velNow);
+  //  Serial.println(pulse);
+  //  Serial.println(digitalRead(enPin));
+  if(millis()-lCount > 500 && wheelsTurn == 0 && rCount == 1) {
+    rCount = 0;
+    digitalWrite(enPin, HIGH);
+    pulse = 1;
+  }
+}
+
+void accelerate(){
+  if(velNow < velNew) {
+    velNext = velNext++; 
+  }
+  else if (velNow > velNew) {
+    velNext = velNext--; 
+  }
+  velNow = velNext; //this is a check to make sure accn is tied to motor commands
+}
+
+void rotate(){
+  rWheelVel = velNext-rRead; // now uses lRead and rRead, rather than yRead
+  if(rWheelVel>22)rWheelVel=22;
+  if(rWheelVel<-22)rWheelVel=-22;
+  lWheelVel = velNext-lRead; // now uses lRead and rRead, rather than yRead
+  if(lWheelVel>22)lWheelVel=22;
+  if(lWheelVel<-22)lWheelVel=-22;
+
+  if(rWheelVel <0) {
+    if(lWheelVel>0) lWheelVel=0;
+  }
+  if(lWheelVel <0) {
+    if(rWheelVel>0) rWheelVel=0;
+  }
+
+  //Sort direction out
+  if(rWheelVel <0) {
+    digitalWrite(rDirPin, HIGH);
+  }
+  else {
+    digitalWrite(rDirPin, LOW);
+  }
+  if(lWheelVel <0) {
+    digitalWrite(lDirPin, LOW);
+  }
+  else {
+    digitalWrite(lDirPin, HIGH);
+  }
+  rWheelVel = abs(rWheelVel);
+  lWheelVel = abs(lWheelVel);
+  //   if (rWheelVel < 15)rWheelVel = 15;
+  //  if (lWheelVel < 15)lWheelVel = 15;
+  //  Serial.println(pulseArray[abs(velNext)]);
+  //  Serial.println(velNext);
+  //  Serial.println(velNew);
+
+  //  cli();
+  rLim =  pulseArray[rWheelVel];
+  lLim =  pulseArray[lWheelVel];
+  //  sei();
+  //  Serial.println(rLim);
+
+}  
+
+void readDirn(){
+  velNew = analogRead(xPin);
+  if(abs(velNew-511) <20) velNew = 512;
+  velNew = map (velNew, 0,1023,-20, 20);
+  yRead=0; // reset to zero in case reversing
+  lRead = 0;
+  rRead = 0;
+  if (velNew>1){ //only read L-R input if requesting forward motion
+    yRead = analogRead(yPin);
+    if(abs(yRead-511) <25) yRead = 512;
+    yRead = map (yRead, 0,1023,-6, 6);
+    //  
+    if(yRead<0) {
+      lRead = abs(yRead);
+      rRead = 0;
+    }
+    if(yRead>0) {
+      rRead = abs(yRead);
+      lRead = 0;
+    }
+  }
+  // 
+  if (velNew < -19) velNew = -19; //denotes maximum reverse speed
+  if (velNow == 0) {
+    if((abs(velNew)+ abs(yRead))>0) {
+      digitalWrite(enPin, LOW);
+      pulse = 1;
+    }
+  }
+  //    Serial.println(velNow);
+  //    Serial.println(velNew);
+  //    Serial.println();
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+  lPulse++;
+  rPulse++;
+  if(lPulse>lLim){
+    digitalWrite(lStepPin, pulse);
+    digitalWrite(lStepPin, LOW);
+    lPulse = 0;
+  }
+  if(rPulse>rLim){
+    digitalWrite(rStepPin, pulse);
+    digitalWrite(rStepPin, LOW);
+    rPulse = 0;
+  }
+}
